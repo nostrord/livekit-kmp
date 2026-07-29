@@ -8,10 +8,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import livekit.proto.AudioSourceOptions
+import livekit.proto.AudioSourceType
 import livekit.proto.ConnectRequest
+import livekit.proto.CreateAudioTrackRequest
 import livekit.proto.DisconnectRequest
 import livekit.proto.FfiRequest
+import livekit.proto.LocalTrackMuteRequest
+import livekit.proto.NewAudioSourceRequest
+import livekit.proto.PublishTrackRequest
 import livekit.proto.RoomOptions
+import livekit.proto.TrackPublishOptions
+import livekit.proto.TrackSource
 
 /** Where the connection to a room currently stands. */
 enum class RoomState { Disconnected, Connecting, Connected, Reconnecting }
@@ -53,7 +61,16 @@ class LiveKitRoom(private val scope: CoroutineScope) {
 
     /** The FFI's handle for this room; also the key its events are tagged with. */
     private var roomHandle: Long? = null
+    private var localParticipantHandle: Long? = null
     private var eventJob: Job? = null
+
+    /** The published microphone track, once [setMicrophoneEnabled] has turned it on. */
+    private var microphoneTrackHandle: Long? = null
+
+    private val _microphoneEnabled = MutableStateFlow(false)
+
+    /** Whether this client is currently sending audio. */
+    val microphoneEnabled: StateFlow<Boolean> = _microphoneEnabled.asStateFlow()
 
     /**
      * Join the room [token] grants access to, at [url] (the LiveKit server's `wss://` URL).
@@ -74,6 +91,7 @@ class LiveKitRoom(private val scope: CoroutineScope) {
             val joined = result.result ?: throw FfiException("the FFI reported neither a room nor an error")
 
             roomHandle = joined.room.handle.id
+            localParticipantHandle = joined.local_participant.handle.id
             _participants.value = buildList {
                 add(joined.local_participant.info.toParticipant(isLocal = true))
                 joined.participants.forEach { add(it.participant.info.toParticipant(isLocal = false)) }
@@ -83,14 +101,79 @@ class LiveKitRoom(private val scope: CoroutineScope) {
         } catch (e: Throwable) {
             _state.value = RoomState.Disconnected
             roomHandle = null
+            localParticipantHandle = null
             throw e
         }
+    }
+
+    /**
+     * Start or stop sending microphone audio.
+     *
+     * The first enable publishes a track backed by [audio]; later toggles mute and unmute that
+     * same publication rather than republishing, which avoids a renegotiation round trip and
+     * keeps the participant visible as a publisher throughout.
+     *
+     * Capture itself belongs to WebRTC's device module, so no PCM is pumped from Kotlin and
+     * echo cancellation runs on the right side of the device loop.
+     */
+    suspend fun setMicrophoneEnabled(enabled: Boolean, audio: PlatformAudio) {
+        val participant = localParticipantHandle ?: throw FfiException("join a room before publishing audio")
+
+        val track = microphoneTrackHandle ?: run {
+            if (!enabled) return
+            publishMicrophone(participant, audio).also { microphoneTrackHandle = it }
+        }
+        FfiClient.request(
+            FfiRequest(local_track_mute = LocalTrackMuteRequest(track_handle = track, mute = !enabled)),
+        )
+        _microphoneEnabled.value = enabled
+    }
+
+    private suspend fun publishMicrophone(participant: Long, audio: PlatformAudio): Long {
+        val source = FfiClient.request(
+            FfiRequest(
+                new_audio_source = NewAudioSourceRequest(
+                    type = AudioSourceType.AUDIO_SOURCE_PLATFORM,
+                    platform_audio_handle = audio.handle,
+                    // Let WebRTC clean up the signal: without these a speaker on a laptop
+                    // feeds straight back into its own microphone.
+                    options = AudioSourceOptions(
+                        echo_cancellation = true,
+                        noise_suppression = true,
+                        auto_gain_control = true,
+                    ),
+                ),
+            ),
+        ).new_audio_source?.source ?: throw FfiException("could not open the microphone")
+
+        val track = FfiClient.request(
+            FfiRequest(
+                create_audio_track = CreateAudioTrackRequest(name = "microphone", source_handle = source.handle.id),
+            ),
+        ).create_audio_track?.track ?: throw FfiException("could not create the microphone track")
+
+        val published = FfiClient.requestAsync(
+            request = FfiRequest(
+                publish_track = PublishTrackRequest(
+                    local_participant_handle = participant,
+                    track_handle = track.handle.id,
+                    options = TrackPublishOptions(source = TrackSource.SOURCE_MICROPHONE),
+                ),
+            ),
+            asyncId = { it.publish_track?.async_id },
+            callback = { event, id -> event.publish_track?.takeIf { it.async_id == id } },
+        )
+        published.error?.takeIf { it.isNotBlank() }?.let { throw FfiException("could not publish audio: $it") }
+        return track.handle.id
     }
 
     /** Leave the room and release its FFI handle. Idempotent. */
     suspend fun disconnect() {
         val handle = roomHandle ?: return
         roomHandle = null
+        localParticipantHandle = null
+        microphoneTrackHandle = null
+        _microphoneEnabled.value = false
         eventJob?.cancel()
         eventJob = null
         try {
@@ -147,6 +230,9 @@ class LiveKitRoom(private val scope: CoroutineScope) {
                 // Server-initiated close: the handle is dead, so drop straight to Disconnected
                 // rather than waiting for a disconnect() that is never coming.
                 roomHandle = null
+                localParticipantHandle = null
+                microphoneTrackHandle = null
+                _microphoneEnabled.value = false
                 _state.value = RoomState.Disconnected
                 _participants.value = emptyList()
             }

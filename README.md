@@ -8,16 +8,17 @@ covers desktop, Android and iOS instead of maintaining three separate integratio
 
 ## Status
 
-**Early, but joinable.** The native transport works and a `LiveKitRoom` sits on top of it with
-connect / disconnect, connection state and a live participant list. Media is not wired yet.
+**Early, but usable for voice.** Join a room, publish the microphone, mute and unmute.
+Video is not wired yet.
 
 | | State |
 |---|---|
 | FFI transport (JVM) | works, covered by a test |
 | Per-platform native artifacts | linux / macos / windows, x86_64 + arm64 |
 | Room API (connect, state, participants) | works |
-| Tracks (publish / subscribe) | not started |
-| Audio device I/O | not started |
+| Microphone publish / mute | works |
+| Audio devices (enumerate, select) | works, via WebRTC's ADM |
+| Video | not started |
 | Android / iOS targets | not started |
 
 ## How it fits together
@@ -43,13 +44,23 @@ val room = LiveKitRoom(scope)
 room.connect(url = serverUrl, token = jwt)   // suspends until the server accepts or rejects
 room.state.collect { … }                     // Disconnected / Connecting / Connected / Reconnecting
 room.participants.collect { … }              // joins, leaves and active speakers
+
+val audio = PlatformAudio.open()
+audio.devices()                              // microphones and speakers
+room.setMicrophoneEnabled(true, audio)       // publishes; later calls mute the same track
+
 room.disconnect()
 ```
 
 ## Notes
 
-- The FFI does **no device I/O**. Audio and video are frame-fed: push PCM/I420 frames to a
-  source, read frames from a stream. Encoding, echo cancellation and resampling are provided.
+- Audio needs no PCM pumping. The FFI exposes WebRTC's Audio Device Module (`PlatformAudio`),
+  which owns capture and playback and enumerates devices, so a desktop app needs nothing from
+  `javax.sound.sampled`. It also puts echo cancellation on the right side of the device loop,
+  which hand-fed frames cannot achieve. A push-based source exists too, for callers that have
+  their own frames.
+- Video **is** frame-fed: push I420 to a source, read frames from a stream. Encoding is the
+  FFI's job either way.
 - `size_t` is mapped to `Long`, correct on 64-bit only. Every desktop binary LiveKit ships is
   64-bit; a 32-bit target would need a size mapper.
 - The event callback runs on LiveKit's threads and must not block, so it copies the bytes and
