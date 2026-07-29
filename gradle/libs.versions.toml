@@ -1,0 +1,24 @@
+[versions]
+kotlin = "2.2.20"
+agp = "8.13.0"
+mavenPublish = "0.36.0"
+coroutines = "1.10.2"
+# Wire generates Kotlin Multiplatform code and speaks proto2, which livekit-ffi requires
+# (its protocol uses `required` fields).
+wire = "5.3.5"
+jna = "5.18.1"
+
+# The livekit-ffi release these bindings are generated against. Both the .proto files and
+# the prebuilt native binaries come from this exact tag, so they cannot drift apart.
+livekitFfi = "0.12.72"
+
+[libraries]
+coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+wire-runtime = { module = "com.squareup.wire:wire-runtime", version.ref = "wire" }
+jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+
+[plugins]
+kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+androidLibrary = { id = "com.android.library", version.ref = "agp" }
+mavenPublish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }
+wire = { id = "com.squareup.wire", version.ref = "wire" }
