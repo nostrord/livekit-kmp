@@ -44,6 +44,10 @@ internal actual class FfiTransport actual constructor() {
         }
     }
 
+    actual fun dropHandle(handleId: Long) {
+        FfiLibrary.INSTANCE.livekit_ffi_drop_handle(handleId)
+    }
+
     actual fun dispose() {
         FfiLibrary.INSTANCE.livekit_ffi_dispose()
         callback = null

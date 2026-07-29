@@ -30,6 +30,14 @@ internal expect class FfiTransport() {
      */
     fun request(request: ByteArray): ByteArray
 
+    /**
+     * Release an FFI-owned object (a video buffer, a track, a room).
+     *
+     * Anything the protocol calls `Owned*` belongs to the caller once handed over. Frames are
+     * the case that bites: at 30 fps a leaked buffer per frame is tens of megabytes a second.
+     */
+    fun dropHandle(handleId: Long)
+
     fun dispose()
 }
 

@@ -86,6 +86,11 @@ object FfiClient {
         result.await()
     }
 
+    /** Release an FFI-owned object. See [FfiTransport.dropHandle]. */
+    fun dropHandle(handleId: Long) {
+        transport.dropHandle(handleId)
+    }
+
     /** Tear the FFI server down. Only for process shutdown and tests. */
     fun dispose() {
         if (!started.compareAndSet(true, false)) return

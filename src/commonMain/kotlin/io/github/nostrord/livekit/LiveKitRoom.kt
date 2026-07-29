@@ -4,6 +4,7 @@ import io.github.nostrord.livekit.ffi.FfiClient
 import io.github.nostrord.livekit.ffi.FfiException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -12,6 +13,7 @@ import livekit.proto.AudioSourceOptions
 import livekit.proto.AudioSourceType
 import livekit.proto.ConnectRequest
 import livekit.proto.CreateAudioTrackRequest
+import livekit.proto.CreateVideoTrackRequest
 import livekit.proto.DisconnectRequest
 import livekit.proto.FfiRequest
 import livekit.proto.LocalTrackMuteRequest
@@ -35,6 +37,7 @@ enum class RoomState { Disconnected, Connecting, Connected, Reconnecting }
  *
  * [audioSubscribed] means their audio track is being received; combined with [audioMuted] it is
  * the difference between "not sending" and "sending silence", which a UI shows differently.
+ * [videoSubscribed] is when [LiveKitRoom.videoFrames] has something to hand back.
  */
 data class Participant(
     val sid: String,
@@ -44,6 +47,7 @@ data class Participant(
     val isSpeaking: Boolean = false,
     val audioSubscribed: Boolean = false,
     val audioMuted: Boolean = false,
+    val videoSubscribed: Boolean = false,
 )
 
 /**
@@ -81,6 +85,9 @@ class LiveKitRoom(
 
     /** The published microphone track, once [setMicrophoneEnabled] has turned it on. */
     private var microphoneTrackHandle: Long? = null
+
+    /** Remote video tracks by participant identity, so [videoFrames] can find them. */
+    private val remoteVideoTracks = mutableMapOf<String, Long>()
 
     private val _microphoneEnabled = MutableStateFlow(false)
 
@@ -144,6 +151,54 @@ class LiveKitRoom(
         )
         _microphoneEnabled.value = enabled
     }
+
+    /**
+     * Publish a video track fed by the returned [VideoSource].
+     *
+     * There is no camera here on purpose: the JDK has no capture API, and libwebrtc's desktop
+     * capturer is not exposed through the FFI, so the pixels are the caller's to produce.
+     * [width] and [height] size the encoder's simulcast layers; frames of other sizes still go
+     * through. Set [isScreencast] for screen content, which tells the encoder to favour detail
+     * over frame rate.
+     */
+    suspend fun publishVideo(width: Int, height: Int, isScreencast: Boolean = false): VideoSource {
+        val participant = localParticipantHandle ?: throw FfiException("join a room before publishing video")
+        val source = VideoSource.create(width, height, isScreencast)
+
+        val track = FfiClient.request(
+            FfiRequest(
+                create_video_track = CreateVideoTrackRequest(
+                    name = if (isScreencast) "screen" else "camera",
+                    source_handle = source.handle,
+                ),
+            ),
+        ).create_video_track?.track ?: throw FfiException("could not create the video track")
+
+        val published = FfiClient.requestAsync(
+            request = FfiRequest(
+                publish_track = PublishTrackRequest(
+                    local_participant_handle = participant,
+                    track_handle = track.handle.id,
+                    options = TrackPublishOptions(
+                        source = if (isScreencast) TrackSource.SOURCE_SCREENSHARE else TrackSource.SOURCE_CAMERA,
+                    ),
+                ),
+            ),
+            asyncId = { it.publish_track?.async_id },
+            callback = { event, id -> event.publish_track?.takeIf { it.async_id == id } },
+        )
+        published.error?.takeIf { it.isNotBlank() }?.let { throw FfiException("could not publish video: $it") }
+        return source
+    }
+
+    /**
+     * Frames from [identity]'s video track, or null while they are not publishing one.
+     *
+     * The flow ends when the track goes away. Call again after a later subscription; the
+     * participant list's own updates are the signal that there is something to call for.
+     */
+    fun videoFrames(identity: String): Flow<VideoFrame>? =
+        remoteVideoTracks[identity]?.let { videoStream(it) }
 
     private suspend fun publishMicrophone(participant: Long, audio: PlatformAudio): Long {
         val source = FfiClient.request(
@@ -237,16 +292,25 @@ class LiveKitRoom(
 
             event.track_subscribed != null -> {
                 val subscribed = event.track_subscribed!!
-                if (subscribed.track.info.kind == TrackKind.KIND_AUDIO) {
-                    updateParticipant(subscribed.participant_identity) {
+                when (subscribed.track.info.kind) {
+                    TrackKind.KIND_AUDIO -> updateParticipant(subscribed.participant_identity) {
                         it.copy(audioSubscribed = true, audioMuted = subscribed.track.info.muted)
                     }
+
+                    TrackKind.KIND_VIDEO -> {
+                        remoteVideoTracks[subscribed.participant_identity] = subscribed.track.handle.id
+                        updateParticipant(subscribed.participant_identity) { it.copy(videoSubscribed = true) }
+                    }
+
+                    else -> Unit
                 }
             }
 
             event.track_unsubscribed != null -> {
-                updateParticipant(event.track_unsubscribed!!.participant_identity) {
-                    it.copy(audioSubscribed = false, audioMuted = false, isSpeaking = false)
+                val identity = event.track_unsubscribed!!.participant_identity
+                remoteVideoTracks.remove(identity)
+                updateParticipant(identity) {
+                    it.copy(audioSubscribed = false, audioMuted = false, isSpeaking = false, videoSubscribed = false)
                 }
             }
 
