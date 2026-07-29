@@ -8,15 +8,15 @@ covers desktop, Android and iOS instead of maintaining three separate integratio
 
 ## Status
 
-**Early.** The native transport works: `liblivekit_ffi` loads from the jar, protobuf requests
-cross the C ABI, responses decode, and the async event callback is wired to a `SharedFlow`.
-There is no room API on top of it yet.
+**Early, but joinable.** The native transport works and a `LiveKitRoom` sits on top of it with
+connect / disconnect, connection state and a live participant list. Media is not wired yet.
 
 | | State |
 |---|---|
 | FFI transport (JVM) | works, covered by a test |
 | Per-platform native artifacts | linux / macos / windows, x86_64 + arm64 |
-| Room API (connect, tracks, participants) | not started |
+| Room API (connect, state, participants) | works |
+| Tracks (publish / subscribe) | not started |
 | Audio device I/O | not started |
 | Android / iOS targets | not started |
 
@@ -35,6 +35,16 @@ The build pins one FFI version (`libs.versions.toml` -> `livekitFfi`) and downlo
 `.proto` files and the native binaries from that exact release tag, so generated code can never
 drift from the binary it talks to. Wire generates the Kotlin (the protocol is proto2). JNA does
 the JVM binding, since the project targets JVM 11 and Panama needs 22+.
+
+## Usage
+
+```kotlin
+val room = LiveKitRoom(scope)
+room.connect(url = serverUrl, token = jwt)   // suspends until the server accepts or rejects
+room.state.collect { … }                     // Disconnected / Connecting / Connected / Reconnecting
+room.participants.collect { … }              // joins, leaves and active speakers
+room.disconnect()
+```
 
 ## Notes
 
