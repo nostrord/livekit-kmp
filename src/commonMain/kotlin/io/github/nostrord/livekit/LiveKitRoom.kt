@@ -161,7 +161,7 @@ class LiveKitRoom(
      * through. Set [isScreencast] for screen content, which tells the encoder to favour detail
      * over frame rate.
      */
-    suspend fun publishVideo(width: Int, height: Int, isScreencast: Boolean = false): VideoSource {
+    suspend fun publishVideo(width: Int, height: Int, isScreencast: Boolean = false): VideoPublication {
         val participant = localParticipantHandle ?: throw FfiException("join a room before publishing video")
         val source = VideoSource.create(width, height, isScreencast)
 
@@ -188,7 +188,7 @@ class LiveKitRoom(
             callback = { event, id -> event.publish_track?.takeIf { it.async_id == id } },
         )
         published.error?.takeIf { it.isNotBlank() }?.let { throw FfiException("could not publish video: $it") }
-        return source
+        return VideoPublication(source, track.handle.id)
     }
 
     /**

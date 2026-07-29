@@ -22,7 +22,7 @@ and publish video from frames you supply. Camera capture is the one gap.
 | Remote video (subscribe, RGBA frames) | works |
 | Video publish (caller-supplied frames) | works |
 | Screen capture (JVM, `java.awt.Robot`) | works, low frame rate |
-| Camera capture | not started, no JDK API |
+| Camera capture (JVM, ffmpeg subprocess) | works where ffmpeg is installed |
 | Android / iOS targets | not started |
 
 ## How it fits together
@@ -90,9 +90,11 @@ video-only client and a bug anywhere else.
   colour conversion are the FFI's job either way, so frames arrive as RGBA ready to draw.
 - Everything the protocol names `Owned*` must be released with `dropHandle`. Video buffers are
   where it bites: at 30 fps a leaked frame is tens of megabytes a second.
-- There is no camera capture. The JDK has no API for it and libwebrtc's desktop capturer is
-  compiled into the binary but not exposed through the FFI. `ScreenCapture` fills the gap with
-  `java.awt.Robot`, which is fine for slides or a terminal and not for motion.
+- Camera capture rides an `ffmpeg` subprocess (`CameraCapture`) reading rawvideo RGBA off
+  stdout, since the JDK has no camera API and libwebrtc's capturers are compiled into the
+  binary but not exposed through the FFI. No ffmpeg installed means no camera, reported as
+  unavailable rather than an error. `ScreenCapture` covers screen sharing with
+  `java.awt.Robot` - fine for slides or a terminal, not for motion.
 - `size_t` is mapped to `Long`, correct on 64-bit only. Every desktop binary LiveKit ships is
   64-bit; a 32-bit target would need a size mapper.
 - The event callback runs on LiveKit's threads and must not block, so it copies the bytes and

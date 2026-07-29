@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.takeWhile
 import livekit.proto.CaptureVideoFrameRequest
 import livekit.proto.FfiRequest
+import livekit.proto.LocalTrackMuteRequest
 import livekit.proto.NewVideoSourceRequest
 import livekit.proto.NewVideoStreamRequest
 import livekit.proto.VideoBufferInfo
@@ -152,5 +153,23 @@ class VideoSource internal constructor(internal val handle: Long, private val is
             ).new_video_source?.source ?: throw FfiException("could not create the video source")
             return VideoSource(source.handle.id, isScreencast)
         }
+    }
+}
+
+/**
+ * A published video track: the [source] frames go into, plus mute control.
+ *
+ * Muting keeps the publication alive, so a camera toggled back on skips the renegotiation
+ * round trip and the participant never disappears as a publisher. Stop feeding frames while
+ * muted; the encoder happily encodes a frozen image otherwise.
+ */
+class VideoPublication internal constructor(
+    val source: VideoSource,
+    private val trackHandle: Long,
+) {
+    fun setMuted(muted: Boolean) {
+        FfiClient.request(
+            FfiRequest(local_track_mute = LocalTrackMuteRequest(track_handle = trackHandle, mute = muted)),
+        )
     }
 }
