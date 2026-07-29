@@ -4,6 +4,7 @@ import java.net.URI
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.wire)
+    `maven-publish`
 }
 
 group = "io.github.nostrord"
@@ -135,8 +136,58 @@ kotlin {
     }
 }
 
-// The natives are resources of the JVM artifact, not of the Kotlin source set.
-tasks.named<ProcessResources>("jvmProcessResources") {
-    dependsOn(downloadFfiNatives)
-    from(nativesDir)
+/*
+ * Native packaging.
+ *
+ * The natives are NOT in the main jvm artifact: at ~20-27 MB each, bundling all six would put
+ * 130 MB into every consumer, and a desktop app packaged per OS ships exactly one of them.
+ * Each platform is published as its own `livekit-kmp-natives-<platform>` jar, laid out under
+ * the JNA resource prefix so `Native.load` finds it on the classpath. Consumers depend on the
+ * platforms they ship (the way secp256k1-kmp splits its JNI artifacts).
+ */
+val nativeJars = desktopNatives.values.associateWith { jnaPrefix ->
+    tasks.register<Jar>("nativeJar${jnaPrefix.split('-').joinToString("") { it.replaceFirstChar(Char::uppercase) }}") {
+        dependsOn(downloadFfiNatives)
+        archiveBaseName.set("livekit-kmp-natives-$jnaPrefix")
+        from(nativesDir.map { it.dir(jnaPrefix) }) {
+            into(jnaPrefix)
+        }
+    }
+}
+
+publishing {
+    publications {
+        nativeJars.forEach { (jnaPrefix, jarTask) ->
+            register<MavenPublication>("natives${jnaPrefix.split('-').joinToString("") { it.replaceFirstChar(Char::uppercase) }}") {
+                artifactId = "livekit-kmp-natives-$jnaPrefix"
+                artifact(jarTask)
+            }
+        }
+    }
+}
+
+/** JNA's resource-prefix name for the machine running the build. */
+fun hostJnaPrefix(): String {
+    val os = System.getProperty("os.name").lowercase()
+    val arch = when (val a = System.getProperty("os.arch").lowercase()) {
+        "amd64", "x86_64" -> "x86-64"
+        "aarch64", "arm64" -> "aarch64"
+        else -> a
+    }
+    val prefix = when {
+        os.startsWith("linux") -> "linux"
+        os.startsWith("mac") || os.startsWith("darwin") -> "darwin"
+        os.startsWith("windows") -> "win32"
+        else -> error("unsupported host os: $os")
+    }
+    return "$prefix-$arch"
+}
+
+// Tests put the host's natives jar on the classpath rather than pointing `jna.library.path` at
+// a directory. That is exactly how a consumer gets the library, so the test covers the
+// packaging too: a jar with the wrong internal layout fails here instead of in someone's app.
+tasks.named<Test>("jvmTest") {
+    val hostNativeJar = nativeJars.getValue(hostJnaPrefix())
+    dependsOn(hostNativeJar)
+    classpath += files(hostNativeJar)
 }

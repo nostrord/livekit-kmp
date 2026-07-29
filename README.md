@@ -15,7 +15,7 @@ There is no room API on top of it yet.
 | | State |
 |---|---|
 | FFI transport (JVM) | works, covered by a test |
-| Prebuilt natives bundled | linux / macos / windows, x86_64 + arm64 |
+| Per-platform native artifacts | linux / macos / windows, x86_64 + arm64 |
 | Room API (connect, tracks, participants) | not started |
 | Audio device I/O | not started |
 | Android / iOS targets | not started |
@@ -44,5 +44,14 @@ the JVM binding, since the project targets JVM 11 and Panama needs 22+.
   64-bit; a 32-bit target would need a size mapper.
 - The event callback runs on LiveKit's threads and must not block, so it copies the bytes and
   drops events rather than stalling if a collector is slow.
-- The jar carries every desktop platform (~130 MB). Per-platform artifacts are the obvious
-  next packaging step, the way `secp256k1-kmp` does it.
+- Natives ship as separate `livekit-kmp-natives-<platform>` artifacts, not inside the main
+  jar, which stays ~3 MB. Depend on the platforms you actually distribute:
+
+  ```kotlin
+  implementation("io.github.nostrord:livekit-kmp-jvm:<version>")
+  implementation("io.github.nostrord:livekit-kmp-natives-linux-x86-64:<version>")
+  ```
+
+  Each native jar lays the library out under its JNA resource prefix, so `Native.load`
+  extracts it off the classpath with no `jna.library.path` needed. The test suite depends on
+  the host's jar the same way, so the packaging is covered by the same test as the transport.
