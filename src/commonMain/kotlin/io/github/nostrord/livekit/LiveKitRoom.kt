@@ -18,6 +18,7 @@ import livekit.proto.LocalTrackMuteRequest
 import livekit.proto.NewAudioSourceRequest
 import livekit.proto.PublishTrackRequest
 import livekit.proto.RoomOptions
+import livekit.proto.TrackKind
 import livekit.proto.TrackPublishOptions
 import livekit.proto.TrackSource
 
@@ -31,6 +32,9 @@ enum class RoomState { Disconnected, Connecting, Connected, Reconnecting }
  * user model. LiveKit keeps it unique within a room, which is exactly why NIP-29 has the relay
  * append a random suffix to the pubkey: that lets one user join twice as two distinct
  * identities rather than the second connection displacing the first.
+ *
+ * [audioSubscribed] means their audio track is being received; combined with [audioMuted] it is
+ * the difference between "not sending" and "sending silence", which a UI shows differently.
  */
 data class Participant(
     val sid: String,
@@ -38,6 +42,8 @@ data class Participant(
     val name: String,
     val isLocal: Boolean = false,
     val isSpeaking: Boolean = false,
+    val audioSubscribed: Boolean = false,
+    val audioMuted: Boolean = false,
 )
 
 /**
@@ -47,10 +53,19 @@ data class Participant(
  * server reports, updated from the room's event stream. One instance per room; create a new one
  * after [disconnect].
  *
- * Media is deliberately absent here — the FFI does no device I/O, so capture and playback are
- * the caller's, fed through the audio and video source APIs.
+ * Audio is handled by WebRTC's device module, so nothing here pumps PCM. Video is not.
  */
-class LiveKitRoom(private val scope: CoroutineScope) {
+class LiveKitRoom(
+    private val scope: CoroutineScope,
+    /**
+     * The platform's audio devices.
+     *
+     * Required to hear anyone: the ADM renders every subscribed remote track, and it only runs
+     * while a handle is held. A room built without one joins deaf, which is the right shape
+     * for a headless or video-only client but a bug anywhere else.
+     */
+    private val audio: PlatformAudio? = null,
+) {
     private val _state = MutableStateFlow(RoomState.Disconnected)
     val state: StateFlow<RoomState> = _state.asStateFlow()
 
@@ -116,8 +131,9 @@ class LiveKitRoom(private val scope: CoroutineScope) {
      * Capture itself belongs to WebRTC's device module, so no PCM is pumped from Kotlin and
      * echo cancellation runs on the right side of the device loop.
      */
-    suspend fun setMicrophoneEnabled(enabled: Boolean, audio: PlatformAudio) {
+    suspend fun setMicrophoneEnabled(enabled: Boolean) {
         val participant = localParticipantHandle ?: throw FfiException("join a room before publishing audio")
+        val audio = audio ?: throw FfiException("this room was built without platform audio, so it cannot publish")
 
         val track = microphoneTrackHandle ?: run {
             if (!enabled) return
@@ -204,7 +220,7 @@ class LiveKitRoom(private val scope: CoroutineScope) {
         }
     }
 
-    private fun apply(event: livekit.proto.RoomEvent) {
+    internal fun apply(event: livekit.proto.RoomEvent) {
         when {
             event.participant_connected != null -> {
                 val joined = event.participant_connected!!.info.info.toParticipant(isLocal = false)
@@ -217,6 +233,32 @@ class LiveKitRoom(private val scope: CoroutineScope) {
             event.participant_disconnected != null -> {
                 val identity = event.participant_disconnected!!.participant_identity
                 _participants.update { current -> current.filterNot { it.identity == identity } }
+            }
+
+            event.track_subscribed != null -> {
+                val subscribed = event.track_subscribed!!
+                if (subscribed.track.info.kind == TrackKind.KIND_AUDIO) {
+                    updateParticipant(subscribed.participant_identity) {
+                        it.copy(audioSubscribed = true, audioMuted = subscribed.track.info.muted)
+                    }
+                }
+            }
+
+            event.track_unsubscribed != null -> {
+                updateParticipant(event.track_unsubscribed!!.participant_identity) {
+                    it.copy(audioSubscribed = false, audioMuted = false, isSpeaking = false)
+                }
+            }
+
+            // Mute events carry no track kind, so they are applied to audio unconditionally.
+            // A video-only mute would set a flag no audio UI reads, which is harmless; the
+            // alternative is tracking every publication's kind for no gain here.
+            event.track_muted != null -> {
+                updateParticipant(event.track_muted!!.participant_identity) { it.copy(audioMuted = true) }
+            }
+
+            event.track_unmuted != null -> {
+                updateParticipant(event.track_unmuted!!.participant_identity) { it.copy(audioMuted = false) }
             }
 
             event.active_speakers_changed != null -> {
@@ -239,6 +281,12 @@ class LiveKitRoom(private val scope: CoroutineScope) {
 
             event.reconnecting != null -> _state.value = RoomState.Reconnecting
             event.reconnected != null -> _state.value = RoomState.Connected
+        }
+    }
+
+    private fun updateParticipant(identity: String, block: (Participant) -> Participant) {
+        _participants.update { current ->
+            current.map { if (it.identity == identity) block(it) else it }
         }
     }
 

@@ -8,8 +8,8 @@ covers desktop, Android and iOS instead of maintaining three separate integratio
 
 ## Status
 
-**Early, but usable for voice.** Join a room, publish the microphone, mute and unmute.
-Video is not wired yet.
+**Voice works.** Join a room, be heard, hear everyone else, mute and unmute. Video is not
+wired yet.
 
 | | State |
 |---|---|
@@ -17,6 +17,7 @@ Video is not wired yet.
 | Per-platform native artifacts | linux / macos / windows, x86_64 + arm64 |
 | Room API (connect, state, participants) | works |
 | Microphone publish / mute | works |
+| Remote audio (playback, subscription state) | works |
 | Audio devices (enumerate, select) | works, via WebRTC's ADM |
 | Video | not started |
 | Android / iOS targets | not started |
@@ -45,12 +46,25 @@ room.connect(url = serverUrl, token = jwt)   // suspends until the server accept
 room.state.collect { … }                     // Disconnected / Connecting / Connected / Reconnecting
 room.participants.collect { … }              // joins, leaves and active speakers
 
-val audio = PlatformAudio.open()
-audio.devices()                              // microphones and speakers
-room.setMicrophoneEnabled(true, audio)       // publishes; later calls mute the same track
-
-room.disconnect()
 ```
+
+Hearing anyone requires platform audio, so it belongs to the room:
+
+```kotlin
+val audio = PlatformAudio.open()
+val room = LiveKitRoom(scope, audio)
+room.connect(url, token)
+
+audio.devices()                    // microphones and speakers
+audio.selectMicrophone(device)
+
+room.setMicrophoneEnabled(true)    // publishes once; later calls mute that same track
+room.participants                  // audioSubscribed / audioMuted / isSpeaking per person
+```
+
+A room built without a `PlatformAudio` joins deaf: WebRTC's ADM renders every subscribed
+remote track and only runs while a handle is held. That is the right shape for a headless or
+video-only client and a bug anywhere else.
 
 ## Notes
 
