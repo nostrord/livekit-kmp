@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
 import livekit.proto.AudioSourceOptions
 import livekit.proto.AudioSourceType
@@ -22,6 +23,7 @@ import livekit.proto.IceTransportType
 import livekit.proto.LocalTrackMuteRequest
 import livekit.proto.NewAudioSourceRequest
 import livekit.proto.PublishTrackRequest
+import livekit.proto.ReadyForRoomEventRequest
 import livekit.proto.RoomOptions
 import livekit.proto.RtcConfig
 import livekit.proto.TrackKind
@@ -319,12 +321,24 @@ class LiveKitRoom(
      * callback, so an app in two rooms would otherwise cross their state.
      */
     private fun watchEvents() {
+        val handle = roomHandle ?: return
         eventJob = scope.launch {
-            FfiClient.events.collect { event ->
-                val roomEvent = event.room_event ?: return@collect
-                if (roomEvent.room_handle != roomHandle) return@collect
-                apply(roomEvent)
-            }
+            FfiClient.events
+                .onSubscription {
+                    // The FFI holds the room's event stream until the client declares itself
+                    // ready, and tears the room down ("timed out waiting for
+                    // ReadyForRoomEventRequest after ConnectCallback") ~15s in if it never
+                    // does. Sent from onSubscription so no event can slip through between
+                    // the ready request and this collector attaching.
+                    FfiClient.request(
+                        FfiRequest(ready_for_room_event = ReadyForRoomEventRequest(room_handle = handle)),
+                    )
+                }
+                .collect { event ->
+                    val roomEvent = event.room_event ?: return@collect
+                    if (roomEvent.room_handle != roomHandle) return@collect
+                    apply(roomEvent)
+                }
         }
     }
 
