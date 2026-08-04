@@ -12,20 +12,42 @@ import kotlinx.coroutines.launch
 import livekit.proto.AudioSourceOptions
 import livekit.proto.AudioSourceType
 import livekit.proto.ConnectRequest
+import livekit.proto.ContinualGatheringPolicy
 import livekit.proto.CreateAudioTrackRequest
 import livekit.proto.CreateVideoTrackRequest
+import livekit.proto.DisconnectReason
 import livekit.proto.DisconnectRequest
 import livekit.proto.FfiRequest
+import livekit.proto.IceTransportType
 import livekit.proto.LocalTrackMuteRequest
 import livekit.proto.NewAudioSourceRequest
 import livekit.proto.PublishTrackRequest
 import livekit.proto.RoomOptions
+import livekit.proto.RtcConfig
 import livekit.proto.TrackKind
 import livekit.proto.TrackPublishOptions
 import livekit.proto.TrackSource
 
 /** Where the connection to a room currently stands. */
 enum class RoomState { Disconnected, Connecting, Connected, Reconnecting }
+
+/**
+ * Why a room ended.
+ *
+ * The difference matters to a caller deciding what to do next: [ConnectionLost] is worth
+ * rejoining, [Removed] and [DuplicateIdentity] are not — the second one comes back the moment
+ * the same identity joins from somewhere else, so retrying just fights the other session.
+ */
+enum class DisconnectCause {
+    ClientLeft,
+    DuplicateIdentity,
+    Removed,
+    RoomClosed,
+    ServerShutdown,
+    JoinFailure,
+    ConnectionLost,
+    Unknown,
+}
 
 /**
  * One participant in the room.
@@ -73,6 +95,11 @@ class LiveKitRoom(
     private val _state = MutableStateFlow(RoomState.Disconnected)
     val state: StateFlow<RoomState> = _state.asStateFlow()
 
+    private val _disconnectCause = MutableStateFlow<DisconnectCause?>(null)
+
+    /** Why the room last ended, null while it has never been up. Cleared on [connect]. */
+    val disconnectCause: StateFlow<DisconnectCause?> = _disconnectCause.asStateFlow()
+
     private val _participants = MutableStateFlow<List<Participant>>(emptyList())
 
     /** Everyone in the room, local participant first. */
@@ -102,6 +129,7 @@ class LiveKitRoom(
      */
     suspend fun connect(url: String, token: String, options: RoomOptions = defaultOptions) {
         check(roomHandle == null) { "already connected; create a new LiveKitRoom per room" }
+        _disconnectCause.value = null
         _state.value = RoomState.Connecting
         try {
             val result = FfiClient.requestAsync(
@@ -138,12 +166,12 @@ class LiveKitRoom(
      * Capture itself belongs to WebRTC's device module, so no PCM is pumped from Kotlin and
      * echo cancellation runs on the right side of the device loop.
      */
-    suspend fun setMicrophoneEnabled(enabled: Boolean) {
+    suspend fun setMicrophoneEnabled(enabled: Boolean) = onLiveEngine {
         val participant = localParticipantHandle ?: throw FfiException("join a room before publishing audio")
         val audio = audio ?: throw FfiException("this room was built without platform audio, so it cannot publish")
 
         val track = microphoneTrackHandle ?: run {
-            if (!enabled) return
+            if (!enabled) return@onLiveEngine
             publishMicrophone(participant, audio).also { microphoneTrackHandle = it }
         }
         FfiClient.request(
@@ -161,7 +189,7 @@ class LiveKitRoom(
      * through. Set [isScreencast] for screen content, which tells the encoder to favour detail
      * over frame rate.
      */
-    suspend fun publishVideo(width: Int, height: Int, isScreencast: Boolean = false): VideoPublication {
+    suspend fun publishVideo(width: Int, height: Int, isScreencast: Boolean = false): VideoPublication = onLiveEngine {
         val participant = localParticipantHandle ?: throw FfiException("join a room before publishing video")
         val source = VideoSource.create(width, height, isScreencast)
 
@@ -188,7 +216,32 @@ class LiveKitRoom(
             callback = { event, id -> event.publish_track?.takeIf { it.async_id == id } },
         )
         published.error?.takeIf { it.isNotBlank() }?.let { throw FfiException("could not publish video: $it") }
-        return VideoPublication(source, track.handle.id)
+        VideoPublication(source, track.handle.id)
+    }
+
+    /**
+     * Run an FFI call that needs a live RTC engine, noticing when it does not have one.
+     *
+     * The engine can die without the FFI emitting a disconnect event — a failed ICE
+     * negotiation ends as `engine is closed` on the next publish instead. Left alone, [state]
+     * would keep claiming Connected for a room nobody can be heard in, so the failure is
+     * treated as the disconnect it really is and the caller can rejoin.
+     */
+    private suspend inline fun <T> onLiveEngine(block: () -> T): T = try {
+        block()
+    } catch (e: Throwable) {
+        if (e.message?.contains(ENGINE_CLOSED) == true) markDisconnected(DisconnectCause.ConnectionLost)
+        throw e
+    }
+
+    private fun markDisconnected(cause: DisconnectCause) {
+        roomHandle = null
+        localParticipantHandle = null
+        microphoneTrackHandle = null
+        _microphoneEnabled.value = false
+        _disconnectCause.value = cause
+        _state.value = RoomState.Disconnected
+        _participants.value = emptyList()
     }
 
     /**
@@ -335,12 +388,7 @@ class LiveKitRoom(
             event.disconnected != null -> {
                 // Server-initiated close: the handle is dead, so drop straight to Disconnected
                 // rather than waiting for a disconnect() that is never coming.
-                roomHandle = null
-                localParticipantHandle = null
-                microphoneTrackHandle = null
-                _microphoneEnabled.value = false
-                _state.value = RoomState.Disconnected
-                _participants.value = emptyList()
+                markDisconnected(event.disconnected!!.reason.toCause())
             }
 
             event.reconnecting != null -> _state.value = RoomState.Reconnecting
@@ -359,16 +407,47 @@ class LiveKitRoom(
     }
 
     private companion object {
+        /** What the FFI says when the RTC engine is gone and only a rejoin can fix it. */
+        const val ENGINE_CLOSED = "engine is closed"
+
         /**
          * Auto-subscribe so remote tracks arrive without a round trip, adaptive stream and
          * dynacast so an unrendered or unheard track stops costing bandwidth.
+         *
+         * ICE gathers continually and over every transport, which is what survives a network
+         * that moves under the connection: a VPN coming up, a laptop changing Wi-Fi. Gathering
+         * once freezes the candidate set at join time, so the first path to break takes the
+         * room down with it. TURN over TCP stays in the set for networks that drop UDP, and
+         * the server's own ICE servers still arrive in the join response.
          */
         val defaultOptions = RoomOptions(
             auto_subscribe = true,
             adaptive_stream = true,
             dynacast = true,
+            join_retries = 3,
+            rtc_config = RtcConfig(
+                ice_transport_type = IceTransportType.TRANSPORT_ALL,
+                continual_gathering_policy = ContinualGatheringPolicy.GATHER_CONTINUALLY,
+            ),
         )
     }
+}
+
+private fun DisconnectReason.toCause(): DisconnectCause = when (this) {
+    DisconnectReason.CLIENT_INITIATED -> DisconnectCause.ClientLeft
+    DisconnectReason.DUPLICATE_IDENTITY -> DisconnectCause.DuplicateIdentity
+    DisconnectReason.PARTICIPANT_REMOVED -> DisconnectCause.Removed
+    DisconnectReason.ROOM_DELETED, DisconnectReason.ROOM_CLOSED -> DisconnectCause.RoomClosed
+    DisconnectReason.SERVER_SHUTDOWN -> DisconnectCause.ServerShutdown
+    DisconnectReason.JOIN_FAILURE -> DisconnectCause.JoinFailure
+    DisconnectReason.SIGNAL_CLOSE,
+    DisconnectReason.CONNECTION_TIMEOUT,
+    DisconnectReason.MEDIA_FAILURE,
+    DisconnectReason.STATE_MISMATCH,
+    DisconnectReason.MIGRATION,
+    -> DisconnectCause.ConnectionLost
+
+    else -> DisconnectCause.Unknown
 }
 
 private fun livekit.proto.ParticipantInfo.toParticipant(isLocal: Boolean) = Participant(
